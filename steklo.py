@@ -233,35 +233,93 @@ def format_temp(temp):
     return "%s%d,%d°" % (sign, whole, tenth)
 
 
+def _weather_cache_path():
+    return os.path.join(BASE_DIR, "steklo-weather-cache.json")
+
+
+def _save_weather_cache(weather, city):
+    try:
+        blob = {"city": city, "saved": time.time(), "weather": weather}
+        with open(_weather_cache_path(), "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False)
+    except Exception:
+        write_error()
+
+
+def _load_weather_cache(city):
+    try:
+        path = _weather_cache_path()
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        if str(blob.get("city") or "") != str(city):
+            return None
+        # Кэш не старше 3 часов.
+        if time.time() - float(blob.get("saved") or 0) > 3 * 3600:
+            return None
+        w = blob.get("weather")
+        if isinstance(w, dict) and "temp" in w:
+            return w
+    except Exception:
+        write_error()
+    return None
+
+
 def get_weather(city, api_key):
-    url = (
-        "http://api.openweathermap.org/data/2.5/weather"
-        "?q=%s&appid=%s&units=metric&lang=ru" % (city, api_key)
-    )
-    response = requests.get(url, timeout=1.8)
-    response.raise_for_status()
-    d = response.json()
-    coord = d.get("coord") or {}
-    wind = d.get("wind") or {}
-    w0 = (d.get("weather") or [{}])[0]
-    return {
-        "temp": round(d["main"]["temp"], 1),
-        "condition_id": w0.get("id", 800),
-        "main": w0.get("main") or "Погода",
-        "description": w0.get("description") or w0.get("main") or "Погода",
-        "wind_speed": wind.get("speed", 0) or 0,
-        "wind_deg": wind.get("deg", 0) or 0,
-        "rain_1h": (d.get("rain") or {}).get("1h", 0) or 0,
-        "snow_1h": (d.get("snow") or {}).get("1h", 0) or 0,
-        "clouds_all": (d.get("clouds") or {}).get("all", 0) or 0,
-        "humidity": (d.get("main") or {}).get("humidity", 50) or 50,
-        "timezone": d.get("timezone", 0) or 0,
-        "sunrise": (d.get("sys") or {}).get("sunrise") or 0,
-        "sunset": (d.get("sys") or {}).get("sunset") or 0,
-        "lat": coord.get("lat", _DEFAULT_LAT),
-        "lon": coord.get("lon", _DEFAULT_LON),
-        "dt": d.get("dt", int(time.time())),
-    }
+    """Сразу тянем погоду; https, повтор при сбое, без короткого обрыва."""
+    from urllib.parse import quote
+
+    city = str(city or "Barnaul").strip() or "Barnaul"
+    key = str(api_key or "").strip()
+    q = quote(city)
+    last_err = None
+    for attempt in range(3):
+        for scheme in ("https", "http"):
+            url = (
+                "%s://api.openweathermap.org/data/2.5/weather"
+                "?q=%s&appid=%s&units=metric&lang=ru" % (scheme, q, key)
+            )
+            try:
+                # 5 с на попытку — успеваем даже на медленной сети.
+                response = requests.get(url, timeout=5.0)
+                response.raise_for_status()
+                d = response.json()
+                coord = d.get("coord") or {}
+                wind = d.get("wind") or {}
+                w0 = (d.get("weather") or [{}])[0]
+                weather = {
+                    "temp": round(d["main"]["temp"], 1),
+                    "condition_id": w0.get("id", 800),
+                    "main": w0.get("main") or "Погода",
+                    "description": w0.get("description") or w0.get("main") or "Погода",
+                    "wind_speed": wind.get("speed", 0) or 0,
+                    "wind_deg": wind.get("deg", 0) or 0,
+                    "rain_1h": (d.get("rain") or {}).get("1h", 0) or 0,
+                    "snow_1h": (d.get("snow") or {}).get("1h", 0) or 0,
+                    "clouds_all": (d.get("clouds") or {}).get("all", 0) or 0,
+                    "humidity": (d.get("main") or {}).get("humidity", 50) or 50,
+                    "timezone": d.get("timezone", 0) or 0,
+                    "sunrise": (d.get("sys") or {}).get("sunrise") or 0,
+                    "sunset": (d.get("sys") or {}).get("sunset") or 0,
+                    "lat": coord.get("lat", _DEFAULT_LAT),
+                    "lon": coord.get("lon", _DEFAULT_LON),
+                    "dt": d.get("dt", int(time.time())),
+                }
+                _save_weather_cache(weather, city)
+                write_log("погода: ok %s %s°C (%s try %s)" % (city, weather["temp"], scheme, attempt + 1))
+                return weather
+            except Exception as exc:
+                last_err = exc
+                write_log("погода: %s try%s %s" % (scheme, attempt + 1, exc))
+        time.sleep(0.35 * (attempt + 1))
+    cached = _load_weather_cache(city)
+    if cached:
+        write_log("погода: кэш %s°C" % cached.get("temp"))
+        return cached
+    if last_err:
+        raise last_err
+    raise RuntimeError("погода")
 
 
 def solar_state(lat, lon, unix_utc):
@@ -12257,9 +12315,31 @@ def _preload_webview():
 
 def main():
     write_log("--- START ---")
-    threading.Thread(target=_preload_webview, daemon=True).start()
-    app_ready = threading.Event()
+    # Сначала setup — нужны город и ключ, затем сразу разогрев погоды.
+    cfg = load_setup()
+    want_voice = _yes(cfg.get("ГОЛОС"), True)
+    city = str(cfg.get("ГОРОД") or "Barnaul")
+    api_key = str(cfg.get("API_КЛЮЧ") or "")
+
     weather_box = {"weather": None, "temperature": None}
+    weather_done = threading.Event()
+    app_ready = threading.Event()
+
+    def warm_weather():
+        """Разогрев данных погоды с первой секунды запуска."""
+        try:
+            w = get_weather(city, api_key)
+            weather_box["weather"] = w
+            weather_box["temperature"] = w["temp"]
+            write_log("temperature = %s" % w["temp"])
+            if want_voice and w.get("temp") is not None:
+                threading.Thread(target=prepare_voice, args=(w["temp"],), daemon=True).start()
+        except Exception:
+            write_error()
+            if want_voice:
+                _voice_prep["done"].set()
+        finally:
+            weather_done.set()
 
     def warm_app():
         try:
@@ -12267,43 +12347,24 @@ def main():
         finally:
             app_ready.set()
 
+    # Погода — первый приоритет; картинка и webview греются параллельно.
+    threading.Thread(target=warm_weather, daemon=True).start()
     threading.Thread(target=warm_app, daemon=True).start()
-    cfg = load_setup()
-    want_voice = _yes(cfg.get("ГОЛОС"), True)
+    threading.Thread(target=_preload_webview, daemon=True).start()
 
-    def fetch_weather():
-        try:
-            w = get_weather(str(cfg.get("ГОРОД") or "Barnaul"), str(cfg.get("API_КЛЮЧ") or ""))
-            weather_box["weather"] = w
-            weather_box["temperature"] = w["temp"]
-            write_log("temperature = %s" % w["temp"])
-            # Синтез в отдельном потоке — не тормозит показ окна.
-            if want_voice and w.get("temp") is not None:
-                threading.Thread(target=prepare_voice, args=(w["temp"],), daemon=True).start()
-        except Exception:
-            write_error()
-            if want_voice:
-                _voice_prep["done"].set()
-
-    weather_done = threading.Event()
-
-    def fetch_weather_done():
-        try:
-            fetch_weather()
-        finally:
-            weather_done.set()
-
-    threading.Thread(target=fetch_weather_done, daemon=True).start()
-    # Распаковка в фоне; погоду ждём нормально — иначе сценарий без данных.
-    app_ready.wait(timeout=0.7)
-    weather_done.wait(timeout=1.6)
+    # Не открываем окно без данных: ждём ответ (или кэш) дольше, чем одна попытка API.
+    weather_done.wait(timeout=14)
+    app_ready.wait(timeout=2.0)
     weather = weather_box["weather"]
     temperature = weather_box["temperature"]
+    if weather is None:
+        write_log("погода: нет данных после разогрева")
+    else:
+        write_log("погода: готово к показу")
 
     voice_ready = threading.Event()
     voice = None
     if temperature is not None and want_voice:
-        # prepare_voice уже мог стартовать в fetch; повтор безопасен (started-guard).
         threading.Thread(target=prepare_voice, args=(temperature,), daemon=True).start()
         voice = threading.Thread(
             target=speak_temperature,
